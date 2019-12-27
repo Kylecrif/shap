@@ -23,32 +23,25 @@ class GradientExplainer(Explainer):
     def __init__(self, model, data, session=None, batch_size=50, local_smoothing=0):
         """ An explainer object for a differentiable model using a given background dataset.
 
-        Note that the complexity of the method scales linearly with the number of background data
-        samples. Passing the entire training dataset as `data` will give very accurate expected
-        values, but be unreasonably expensive. The variance of the expectation estimates scale by
-        roughly 1/sqrt(N) for N background data samples. So 100 samples will give a good estimate,
-        and 1000 samples a very good estimate of the expected values.
-
         Parameters
         ----------
-        model : if framework == 'tensorflow', (input : [tf.Tensor], output : tf.Tensor)
-             A pair of TensorFlow tensors (or a list and a tensor) that specifies the input and
-            output of the model to be explained. Note that SHAP values are specific to a single
-            output value, so the output tf.Tensor should be a single dimensional output (,1).
+        model : tf.keras.Model, (input : [tf.Tensor], output : tf.Tensor), torch.nn.Module, or a tuple
+                (model, layer), where both are torch.nn.Module objects
+            
+            For TensorFlow this can be a model object, or a pair of TensorFlow tensors (or a list and
+            a tensor) that specifies the input and output of the model to be explained. Note that for
+            TensowFlow 2 you must pass a tensorflow function, not a tuple of input/output tensors).
 
-            if framework == 'pytorch', an nn.Module object (model), or a tuple (model, layer),
-                where both are nn.Module objects
-            The model is an nn.Module object which takes as input a tensor (or list of tensors) of
-            shape data, and returns a single dimensional output.
-            If the input is a tuple, the returned shap values will be for the input of the
-            layer argument. layer must be a layer in the model, i.e. model.conv2
+            For PyTorch this can be a nn.Module object (model), or a tuple (model, layer), where both
+            are nn.Module objects. The model is an nn.Module object which takes as input a tensor
+            (or list of tensors) of shape data, and returns a single dimensional output. If the input
+            is a tuple, the returned shap values will be for the input of the layer argument. layer must
+            be a layer in the model, i.e. model.conv2.
 
-        data :
-            if framework == 'tensorflow': [numpy.array] or [pandas.DataFrame]
-            if framework == 'pytorch': [torch.tensor]
+        data : [numpy.array] or [pandas.DataFrame] or [torch.tensor]
             The background dataset to use for integrating out features. GradientExplainer integrates
             over these samples. The data passed here must match the input tensors given in the
-            first argument.
+            first argument. Single element lists can be passed unwrapped.
         """
 
         # first, we need to find the framework
@@ -72,7 +65,7 @@ class GradientExplainer(Explainer):
         elif framework == 'pytorch':
             self.explainer = _PyTorchGradientExplainer(model, data, batch_size, local_smoothing)
 
-    def shap_values(self, X, nsamples=200, ranked_outputs=None, output_rank_order="max", rseed=None):
+    def shap_values(self, X, nsamples=200, ranked_outputs=None, output_rank_order="max", rseed=None, return_variances=False):
         """ Return the values for the model applied to X.
 
         Parameters
@@ -109,7 +102,7 @@ class GradientExplainer(Explainer):
         ranked_outputs, and indexes is a matrix that tells for each sample which output indexes
         were chosen as "top".
         """
-        return self.explainer.shap_values(X, nsamples, ranked_outputs, output_rank_order, rseed)
+        return self.explainer.shap_values(X, nsamples, ranked_outputs, output_rank_order, rseed, return_variances)
 
 
 class _TFGradientExplainer(Explainer):
@@ -131,6 +124,7 @@ class _TFGradientExplainer(Explainer):
                 pass
 
         # determine the model inputs and outputs
+        self.model = model
         if str(type(model)).endswith("keras.engine.sequential.Sequential'>"):
             self.model_inputs = model.inputs
             self.model_output = model.layers[-1].output
@@ -154,8 +148,8 @@ class _TFGradientExplainer(Explainer):
         # check if we have multiple inputs
         self.multi_input = True
         if type(self.model_inputs) != list:
-            self.multi_input = False
             self.model_inputs = [self.model_inputs]
+        self.multi_input = len(self.model_inputs) > 1
         if type(data) != list:
             data = [data]
 
@@ -164,20 +158,28 @@ class _TFGradientExplainer(Explainer):
         self.batch_size = batch_size
         self.local_smoothing = local_smoothing
 
-        # if we are not given a session find a default session
-        if session is None:
-            # if keras is installed and already has a session then use it
-            if keras is not None and keras.backend.tensorflow_backend._SESSION is not None:
-                session = keras.backend.get_session()
-            else:
-                session = tf.keras.backend.get_session()
-        self.session = tf.get_default_session() if session is None else session
+        if not tf.executing_eagerly():
+            # if we are not given a session find a default session
+            if session is None:
+                # if keras is installed and already has a session then use it
+                ksess = None
+                if keras is not None:
+                    if hasattr(keras.backend.tensorflow_backend, "_SESSION"):
+                        ksess = keras.backend.tensorflow_backend._SESSION
+                    elif hasattr(keras.backend.tensorflow_backend.tf_keras_backend._SESSION, "session"):
+                        ksess = keras.backend.tensorflow_backend.tf_keras_backend._SESSION.session
+                if keras is not None and ksess is not None:
+                    session = keras.backend.get_session()
+                elif hasattr(tf.keras.backend, "get_session"):
+                    session = tf.keras.backend.get_session()
+        
+            self.session = tf.compat.v1.get_default_session() if session is None else session
 
-        # see if there is a keras operation we need to save
-        self.keras_phase_placeholder = None
-        for op in self.session.graph.get_operations():
-            if 'keras_learning_phase' in op.name:
-                self.keras_phase_placeholder = op.outputs[0]
+            # see if there is a keras operation we need to save
+            self.keras_phase_placeholder = None
+            for op in self.session.graph.get_operations():
+                if 'keras_learning_phase' in op.name:
+                    self.keras_phase_placeholder = op.outputs[0]
 
         # save the expected output of the model
         #self.expected_value = self.run(self.model_output, self.model_inputs, self.data).mean(0)
@@ -189,11 +191,32 @@ class _TFGradientExplainer(Explainer):
 
     def gradient(self, i):
         if self.gradients[i] is None:
-            out = self.model_output[:,i] if self.multi_output else self.model_output
-            self.gradients[i] = tf.gradients(out, self.model_inputs)
+            if not tf.executing_eagerly():
+                out = self.model_output[:,i] if self.multi_output else self.model_output
+                self.gradients[i] = tf.gradients(out, self.model_inputs)
+            else:
+                @tf.function
+                def grad_graph(x):
+                    phase = tf.keras.backend.learning_phase()
+                    tf.keras.backend.set_learning_phase(0)
+
+                    with tf.GradientTape(watch_accessed_variables=False) as tape:
+                        tape.watch(x)
+                        out = self.model(x)
+                        if self.multi_output:
+                            out = out[:,i]
+
+                    x_grad = tape.gradient(out, x)
+                    
+                    tf.keras.backend.set_learning_phase(phase)
+                    
+                    return x_grad
+                
+                self.gradients[i] = grad_graph
+
         return self.gradients[i]
 
-    def shap_values(self, X, nsamples=200, ranked_outputs=None, output_rank_order="max", rseed=None):
+    def shap_values(self, X, nsamples=200, ranked_outputs=None, output_rank_order="max", rseed=None, return_variances=False):
 
         # check if we have multiple inputs
         if not self.multi_input:
@@ -204,7 +227,10 @@ class _TFGradientExplainer(Explainer):
         assert len(self.model_inputs) == len(X), "Number of model inputs does not match the number given!"
 
         # rank and determine the model outputs that we will explain
-        model_output_values = self.run(self.model_output, self.model_inputs, X)
+        if not tf.executing_eagerly():
+            model_output_values = self.run(self.model_output, self.model_inputs, X)
+        else:
+            model_output_values = self.run(self.model, self.model_inputs, X)
         if ranked_outputs is not None and self.multi_output:
             if output_rank_order == "max":
                 model_output_ranks = np.argsort(-model_output_values)
@@ -224,8 +250,9 @@ class _TFGradientExplainer(Explainer):
 
         # compute the attributions
         output_phis = []
-        samples_input = [np.zeros((nsamples,) + X[l].shape[1:]) for l in range(len(X))]
-        samples_delta = [np.zeros((nsamples,) + X[l].shape[1:]) for l in range(len(X))]
+        output_phi_vars = []
+        samples_input = [np.zeros((nsamples,) + X[l].shape[1:], dtype=np.float32) for l in range(len(X))]
+        samples_delta = [np.zeros((nsamples,) + X[l].shape[1:], dtype=np.float32) for l in range(len(X))]
         # use random seed if no argument given
         if rseed is None:
             rseed = np.random.randint(0, 1e6)
@@ -292,18 +319,38 @@ class _TFGradientExplainer(Explainer):
                 #         offset += s
 
             output_phis.append(phis[0] if not self.multi_input else phis)
+            output_phi_vars.append(phi_vars[0] if not self.multi_input else phi_vars)
         if not self.multi_output:
-            return output_phis[0]
+            if return_variances:
+                return output_phis[0], output_phi_vars[0]
+            else:
+                return output_phis[0]
         elif ranked_outputs is not None:
-            return output_phis, model_output_ranks
+            if return_variances:
+                return output_phis, output_phi_vars, model_output_ranks
+            else:
+                return output_phis, model_output_ranks
         else:
-            return output_phis
+            if return_variances:
+                return output_phis, output_phi_vars
+            else:
+                return output_phis
 
     def run(self, out, model_inputs, X):
-        feed_dict = dict(zip(model_inputs, X))
-        if self.keras_phase_placeholder is not None:
-            feed_dict[self.keras_phase_placeholder] = 0
-        return self.session.run(out, feed_dict)
+        if not tf.executing_eagerly():
+            feed_dict = dict(zip(model_inputs, X))
+            if self.keras_phase_placeholder is not None:
+                feed_dict[self.keras_phase_placeholder] = 0
+            return self.session.run(out, feed_dict)
+        else:
+            # build inputs that are correctly shaped, typed, and tf-wrapped
+            inputs = []
+            for i in range(len(X)):
+                shape = list(self.model_inputs[i].shape)
+                shape[0] = -1
+                v = tf.constant(X[i].reshape(shape), dtype=self.model_inputs[i].dtype)
+                inputs.append(v)
+            return out(inputs)
 
 
 class _PyTorchGradientExplainer(Explainer):
@@ -358,7 +405,7 @@ class _PyTorchGradientExplainer(Explainer):
 
         multi_output = False
         outputs = self.model(*self.model_inputs)
-        if outputs.shape[1] > 1:
+        if len(outputs.shape) > 1 and outputs.shape[1] > 1:
             multi_output = True
         self.multi_output = multi_output
 
@@ -374,10 +421,14 @@ class _PyTorchGradientExplainer(Explainer):
         selected = [val for val in outputs[:, idx]]
         if self.input_handle is not None:
             interim_inputs = self.layer.target_input
-            grads = [torch.autograd.grad(selected, input)[0].cpu().numpy() for input in interim_inputs]
+            grads = [torch.autograd.grad(selected, input,
+                                         retain_graph=True if idx + 1 < len(interim_inputs) else None)[0].cpu().numpy()
+                     for idx, input in enumerate(interim_inputs)]
             del self.layer.target_input
         else:
-            grads = [torch.autograd.grad(selected, x)[0].cpu().numpy() for x in X]
+            grads = [torch.autograd.grad(selected, x,
+                                         retain_graph=True if idx + 1 < len(X) else None)[0].cpu().numpy()
+                     for idx, x in enumerate(X)]
         return grads
 
     @staticmethod
@@ -392,7 +443,7 @@ class _PyTorchGradientExplainer(Explainer):
         input_handle = layer.register_forward_hook(self.get_interim_input)
         self.input_handle = input_handle
 
-    def shap_values(self, X, nsamples=200, ranked_outputs=None, output_rank_order="max", rseed=None):
+    def shap_values(self, X, nsamples=200, ranked_outputs=None, output_rank_order="max", rseed=None, return_variances=False):
 
         # X ~ self.model_input
         # X_data ~ self.data
@@ -430,6 +481,7 @@ class _PyTorchGradientExplainer(Explainer):
         # compute the attributions
         X_batches = X[0].shape[0]
         output_phis = []
+        output_phi_vars = []
         # samples_input = input to the model
         # samples_delta = (x - x') for the input being explained - may be an interim input
         samples_input = [torch.zeros((nsamples,) + X[l].shape[1:], device=X[l].device) for l in range(len(X))]
@@ -491,6 +543,7 @@ class _PyTorchGradientExplainer(Explainer):
                     phi_vars[l][j] = samples.var(0) / np.sqrt(samples.shape[0]) # estimate variance of means
 
             output_phis.append(phis[0] if len(self.data) == 1 else phis)
+            output_phi_vars.append(phi_vars[0] if not self.multi_input else phi_vars)
         # cleanup: remove the handles, if they were added
         if self.input_handle is not None:
             self.input_handle.remove()
@@ -498,8 +551,17 @@ class _PyTorchGradientExplainer(Explainer):
             # note: the target input attribute is deleted in the loop
 
         if not self.multi_output:
-            return output_phis[0]
+            if return_variances:
+                return output_phis[0], output_phi_vars[0]
+            else:
+                return output_phis[0]            
         elif ranked_outputs is not None:
-            return output_phis, model_output_ranks
+            if return_variances:
+                return output_phis, output_phi_vars, model_output_ranks
+            else:
+                return output_phis, model_output_ranks
         else:
-            return output_phis
+            if return_variances:
+                return output_phis, output_phi_vars
+            else:
+                return output_phis
